@@ -1,0 +1,8 @@
+# pg_lakehouse_iceberg extension
+# Licensed under Apache License 2.0
+
+comment = 'Apache Iceberg Table Access Method for PostgreSQL'
+default_version = '0.1.0'
+module_pathname = '$libdir/pg_lakehouse_iceberg'
+relocatable = false
+superuser = true

@@ -151,14 +151,17 @@ set(PG_EXTENSION_DIR "${PG_SHAREDIR}/extension")
 set(PG_MODULE_DIR "${PG_PKGLIBDIR}")
 
 # ============================================================================
-# Sub-extensions (to be added as development progresses)
+# Sub-extensions
 # ============================================================================
 
-# pg_lakehouse_core - shared utilities and catalog integration
+# pg_lakehouse_core - shared utilities and catalog integration (planned)
 # add_subdirectory(pg_lakehouse_core)
 
 # pg_lakehouse_iceberg - Iceberg Table Access Method
-# add_subdirectory(pg_lakehouse_iceberg)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/pg_lakehouse_iceberg/CMakeLists.txt")
+    message(STATUS "Adding pg_lakehouse_iceberg extension")
+    add_subdirectory(pg_lakehouse_iceberg)
+endif()
 
 # ============================================================================
 # Status Summary
