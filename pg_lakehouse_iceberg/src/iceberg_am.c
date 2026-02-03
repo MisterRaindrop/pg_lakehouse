@@ -31,6 +31,7 @@
 #include "access/tableam.h"
 #include "access/heapam.h"
 #include "access/amapi.h"
+#include "access/multixact.h"
 #include "access/xact.h"
 #include "catalog/index.h"
 #include "catalog/pg_type.h"
@@ -142,7 +143,7 @@ iceberg_scan_begin(Relation relation, Snapshot snapshot,
         const char *catalog_uri = NULL;  /* Get from reloptions */
 
         /* Open the Iceberg table */
-        scan->table_handle = iceberg_table_open(location, catalog_type,
+        scan->table_handle = iceberg_bridge_table_open(location, catalog_type,
                                                  catalog_uri, &error);
         if (scan->table_handle == NULL)
         {
@@ -164,7 +165,7 @@ iceberg_scan_begin(Relation relation, Snapshot snapshot,
              */
             if (!scan->is_parallel)
             {
-                scan->scan_handle = iceberg_scan_begin(scan->table_handle,
+                scan->scan_handle = iceberg_bridge_scan_begin(scan->table_handle,
                                                         0, /* latest snapshot */
                                                         NULL, /* all columns */
                                                         0,
@@ -195,10 +196,10 @@ iceberg_scan_end(TableScanDesc sscan)
 #ifdef HAVE_ICEBERG_CPP
     /* Cleanup iceberg-cpp handles */
     if (scan->scan_handle)
-        iceberg_scan_end(scan->scan_handle);
+        iceberg_bridge_scan_end(scan->scan_handle);
 
     if (scan->table_handle)
-        iceberg_table_close(scan->table_handle);
+        iceberg_bridge_table_close(scan->table_handle);
 
     if (scan->row_values)
         pfree(scan->row_values);
@@ -222,7 +223,7 @@ iceberg_scan_rescan(TableScanDesc sscan, ScanKey key, bool set_params,
     /* Close current scan handle */
     if (scan->scan_handle)
     {
-        iceberg_scan_end(scan->scan_handle);
+        iceberg_bridge_scan_end(scan->scan_handle);
         scan->scan_handle = NULL;
     }
 
@@ -239,7 +240,7 @@ iceberg_scan_rescan(TableScanDesc sscan, ScanKey key, bool set_params,
     {
         /* For serial scans, reopen the scan */
         IcebergError error = {0};
-        scan->scan_handle = iceberg_scan_begin(scan->table_handle,
+        scan->scan_handle = iceberg_bridge_scan_begin(scan->table_handle,
                                                 0, NULL, 0, &error);
     }
 #endif
@@ -383,12 +384,12 @@ iceberg_parallel_open_task(IcebergScanDesc scan, uint32 task_id)
     /* Close previous task's scan if any */
     if (scan->scan_handle)
     {
-        iceberg_scan_end(scan->scan_handle);
+        iceberg_bridge_scan_end(scan->scan_handle);
         scan->scan_handle = NULL;
     }
 
     /* Open scan for this task */
-    scan->scan_handle = iceberg_parallel_scan_begin(
+    scan->scan_handle = iceberg_bridge_parallel_scan_begin(
         scan->table_handle,
         state,
         task_id,
@@ -438,7 +439,7 @@ iceberg_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
             /* Try to get a row from current task */
             if (scan->scan_handle && !scan->task_exhausted)
             {
-                if (iceberg_scan_next(scan->scan_handle, scan->row_values,
+                if (iceberg_bridge_scan_next(scan->scan_handle, scan->row_values,
                                       natts, &error))
                 {
                     return iceberg_convert_values_to_slot(scan, slot);
@@ -473,7 +474,7 @@ iceberg_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
         IcebergError error = {0};
         int natts = RelationGetNumberOfAttributes(scan->rs_base.rs_rd);
 
-        if (iceberg_scan_next(scan->scan_handle, scan->row_values, natts, &error))
+        if (iceberg_bridge_scan_next(scan->scan_handle, scan->row_values, natts, &error))
         {
             return iceberg_convert_values_to_slot(scan, slot);
         }
@@ -804,7 +805,7 @@ iceberg_parallelscan_initialize(Relation rel, ParallelTableScanDesc pscan)
      * Open the Iceberg table to get file list
      * TODO: Get table options from relation
      */
-    table = iceberg_table_open(NULL, NULL, NULL, &error);
+    table = iceberg_bridge_table_open(NULL, NULL, NULL, &error);
     if (!table)
     {
         elog(WARNING, "iceberg_parallelscan_initialize: failed to open table: %s",
@@ -816,12 +817,12 @@ iceberg_parallelscan_initialize(Relation rel, ParallelTableScanDesc pscan)
     /*
      * Create parallel scan plan (analyzes files, creates tasks)
      */
-    plan = iceberg_parallel_plan_create(table, 0 /* latest snapshot */, &error);
+    plan = iceberg_bridge_parallel_plan_create(table, 0 /* latest snapshot */, &error);
     if (!plan)
     {
         elog(WARNING, "iceberg_parallelscan_initialize: failed to create plan: %s",
              error.message);
-        iceberg_table_close(table);
+        iceberg_bridge_table_close(table);
         ipscan->initialized = 0;
         return sizeof(IcebergParallelScanDescData);
     }
@@ -830,22 +831,22 @@ iceberg_parallelscan_initialize(Relation rel, ParallelTableScanDesc pscan)
      * Serialize the plan to shared memory (after header)
      */
     state_buffer = (char *) pscan + sizeof(IcebergParallelScanDescData);
-    actual_size = iceberg_parallel_plan_serialize(
+    actual_size = iceberg_bridge_parallel_plan_serialize(
         plan,
         state_buffer,
-        iceberg_parallel_plan_get_size(plan)
+        iceberg_bridge_parallel_plan_get_size(plan)
     );
 
     elog(DEBUG1, "iceberg_parallelscan_initialize: files=%u, tasks=%u, size=%zu",
-         iceberg_parallel_plan_get_file_count(plan),
-         iceberg_parallel_plan_get_task_count(plan),
+         iceberg_bridge_parallel_plan_get_file_count(plan),
+         iceberg_bridge_parallel_plan_get_task_count(plan),
          actual_size);
 
     /*
      * Cleanup
      */
-    iceberg_parallel_plan_free(plan);
-    iceberg_table_close(table);
+    iceberg_bridge_parallel_plan_free(plan);
+    iceberg_bridge_table_close(table);
 
     /*
      * Mark as initialized
@@ -962,6 +963,18 @@ iceberg_scan_sample_next_tuple(TableScanDesc scan,
     return false;
 }
 
+/* ------------------------------------------------------------------------
+ * Slot related callbacks for heap AM
+ * ------------------------------------------------------------------------
+ */
+
+static const TupleTableSlotOps *
+heapam_slot_callbacks(Relation relation)
+{
+    return &TTSOpsBufferHeapTuple;
+}
+
+
 /* ----------------------------------------------------------------
  *                      TableAmRoutine definition
  * ----------------------------------------------------------------
@@ -971,7 +984,7 @@ static const TableAmRoutine iceberg_am_methods = {
     .type = T_TableAmRoutine,
 
     /* Slot operations */
-    .slot_callbacks = heap_slot_callbacks,  /* Use heap slot for now */
+    .slot_callbacks = heapam_slot_callbacks,  /* Use heap slot for now */
 
     /* Scan operations */
     .scan_begin = iceberg_scan_begin,
@@ -1064,7 +1077,7 @@ _PG_init(void)
 #ifdef HAVE_ICEBERG_CPP
     {
         IcebergError error = {0};
-        if (iceberg_init(&error) != 0)
+        if (iceberg_bridge_init(&error) != 0)
         {
             elog(WARNING, "pg_lakehouse_iceberg: failed to initialize iceberg-cpp: %s",
                  error.message);
@@ -1092,6 +1105,6 @@ _PG_fini(void)
     elog(LOG, "pg_lakehouse_iceberg: shutting down");
 
 #ifdef HAVE_ICEBERG_CPP
-    iceberg_shutdown();
+    iceberg_bridge_shutdown();
 #endif
 }

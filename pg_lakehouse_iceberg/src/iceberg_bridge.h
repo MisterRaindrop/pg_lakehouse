@@ -34,6 +34,7 @@ extern "C" {
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 /*
  * Opaque handle types for C interface
@@ -42,22 +43,27 @@ typedef struct IcebergTableHandle IcebergTableHandle;
 typedef struct IcebergScanHandle IcebergScanHandle;
 
 /*
+ * Iceberg value type enum (defined outside struct for C++ compatibility)
+ */
+typedef enum IcebergValueType {
+    ICEBERG_TYPE_NULL,
+    ICEBERG_TYPE_BOOL,
+    ICEBERG_TYPE_INT32,
+    ICEBERG_TYPE_INT64,
+    ICEBERG_TYPE_FLOAT,
+    ICEBERG_TYPE_DOUBLE,
+    ICEBERG_TYPE_STRING,
+    ICEBERG_TYPE_BINARY,
+    ICEBERG_TYPE_TIMESTAMP,
+    ICEBERG_TYPE_DATE,
+    ICEBERG_TYPE_DECIMAL
+} IcebergValueType;
+
+/*
  * Column value union for passing data back to PostgreSQL
  */
 typedef struct IcebergValue {
-    enum {
-        ICEBERG_NULL,
-        ICEBERG_BOOL,
-        ICEBERG_INT32,
-        ICEBERG_INT64,
-        ICEBERG_FLOAT,
-        ICEBERG_DOUBLE,
-        ICEBERG_STRING,
-        ICEBERG_BINARY,
-        ICEBERG_TIMESTAMP,
-        ICEBERG_DATE,
-        ICEBERG_DECIMAL
-    } type;
+    IcebergValueType type;
 
     union {
         bool        bool_val;
@@ -100,12 +106,12 @@ typedef struct IcebergError {
  * Initialize the iceberg-cpp library
  * Returns 0 on success, non-zero on failure
  */
-int iceberg_init(IcebergError *error);
+int iceberg_bridge_init(IcebergError *error);
 
 /*
  * Cleanup the iceberg-cpp library
  */
-void iceberg_shutdown(void);
+void iceberg_bridge_shutdown(void);
 
 /*
  * Open an Iceberg table
@@ -119,7 +125,7 @@ void iceberg_shutdown(void);
  * Returns:
  *   Handle to table, or NULL on failure
  */
-IcebergTableHandle *iceberg_table_open(
+IcebergTableHandle *iceberg_bridge_table_open(
     const char *location,
     const char *catalog_type,
     const char *catalog_uri,
@@ -129,12 +135,12 @@ IcebergTableHandle *iceberg_table_open(
 /*
  * Close an Iceberg table handle
  */
-void iceberg_table_close(IcebergTableHandle *table);
+void iceberg_bridge_table_close(IcebergTableHandle *table);
 
 /*
  * Get table metadata
  */
-int iceberg_table_get_info(
+int iceberg_bridge_table_get_info(
     IcebergTableHandle *table,
     IcebergTableInfo *info,
     IcebergError *error
@@ -153,7 +159,7 @@ int iceberg_table_get_info(
  * Returns:
  *   Scan handle, or NULL on failure
  */
-IcebergScanHandle *iceberg_scan_begin(
+IcebergScanHandle *iceberg_bridge_scan_begin(
     IcebergTableHandle *table,
     int64_t snapshot_id,
     const char **column_names,
@@ -173,7 +179,7 @@ IcebergScanHandle *iceberg_scan_begin(
  * Returns:
  *   true if a row was returned, false if end of scan or error
  */
-bool iceberg_scan_next(
+bool iceberg_bridge_scan_next(
     IcebergScanHandle *scan,
     IcebergValue *values,
     int num_cols,
@@ -183,18 +189,18 @@ bool iceberg_scan_next(
 /*
  * End a table scan and release resources
  */
-void iceberg_scan_end(IcebergScanHandle *scan);
+void iceberg_bridge_scan_end(IcebergScanHandle *scan);
 
 /*
  * Get the number of columns in the table schema
  */
-int iceberg_table_get_column_count(IcebergTableHandle *table);
+int iceberg_bridge_table_get_column_count(IcebergTableHandle *table);
 
 /*
  * Get column name by index
  * Returns pointer to internal string, do not free
  */
-const char *iceberg_table_get_column_name(
+const char *iceberg_bridge_table_get_column_name(
     IcebergTableHandle *table,
     int column_index
 );
@@ -203,7 +209,7 @@ const char *iceberg_table_get_column_name(
  * Get column type by index
  * Returns Iceberg type string (e.g., "long", "string", "timestamp")
  */
-const char *iceberg_table_get_column_type(
+const char *iceberg_bridge_table_get_column_type(
     IcebergTableHandle *table,
     int column_index
 );
@@ -279,7 +285,7 @@ typedef struct IcebergParallelPlan IcebergParallelPlan;
  *
  * Returns: Plan handle, or NULL on failure
  */
-IcebergParallelPlan *iceberg_parallel_plan_create(
+IcebergParallelPlan *iceberg_bridge_parallel_plan_create(
     IcebergTableHandle *table,
     int64_t snapshot_id,
     IcebergError *error
@@ -288,7 +294,7 @@ IcebergParallelPlan *iceberg_parallel_plan_create(
 /*
  * Get the size needed for parallel state in shared memory
  */
-size_t iceberg_parallel_plan_get_size(IcebergParallelPlan *plan);
+size_t iceberg_bridge_parallel_plan_get_size(IcebergParallelPlan *plan);
 
 /*
  * Serialize parallel plan to shared memory buffer
@@ -300,7 +306,7 @@ size_t iceberg_parallel_plan_get_size(IcebergParallelPlan *plan);
  *
  * Returns: Actual bytes written, or 0 on failure
  */
-size_t iceberg_parallel_plan_serialize(
+size_t iceberg_bridge_parallel_plan_serialize(
     IcebergParallelPlan *plan,
     void *buffer,
     size_t size
@@ -309,22 +315,22 @@ size_t iceberg_parallel_plan_serialize(
 /*
  * Free a parallel plan
  */
-void iceberg_parallel_plan_free(IcebergParallelPlan *plan);
+void iceberg_bridge_parallel_plan_free(IcebergParallelPlan *plan);
 
 /*
  * Get number of files in plan
  */
-uint32_t iceberg_parallel_plan_get_file_count(IcebergParallelPlan *plan);
+uint32_t iceberg_bridge_parallel_plan_get_file_count(IcebergParallelPlan *plan);
 
 /*
  * Get number of tasks in plan
  */
-uint32_t iceberg_parallel_plan_get_task_count(IcebergParallelPlan *plan);
+uint32_t iceberg_bridge_parallel_plan_get_task_count(IcebergParallelPlan *plan);
 
 /*
  * Get file info from serialized state
  */
-const IcebergFileInfo *iceberg_parallel_state_get_file(
+const IcebergFileInfo *iceberg_bridge_parallel_state_get_file(
     const IcebergParallelState *state,
     uint32_t file_index
 );
@@ -332,7 +338,7 @@ const IcebergFileInfo *iceberg_parallel_state_get_file(
 /*
  * Get task from serialized state
  */
-const IcebergParallelTask *iceberg_parallel_state_get_task(
+const IcebergParallelTask *iceberg_bridge_parallel_state_get_task(
     const IcebergParallelState *state,
     uint32_t task_index
 );
@@ -348,7 +354,7 @@ const IcebergParallelTask *iceberg_parallel_state_get_task(
  *
  * Returns: Scan handle for this task, or NULL on failure
  */
-IcebergScanHandle *iceberg_parallel_scan_begin(
+IcebergScanHandle *iceberg_bridge_parallel_scan_begin(
     IcebergTableHandle *table,
     const IcebergParallelState *state,
     uint32_t task_index,
@@ -358,7 +364,7 @@ IcebergScanHandle *iceberg_parallel_scan_begin(
 /*
  * Detect file format from file path extension
  */
-IcebergFileFormat iceberg_detect_file_format(const char *file_path);
+IcebergFileFormat iceberg_bridge_detect_file_format(const char *file_path);
 
 /*
  * Get chunk count for a file based on its format
@@ -369,7 +375,7 @@ IcebergFileFormat iceberg_detect_file_format(const char *file_path);
  *
  * Returns 0 on error
  */
-uint32_t iceberg_get_file_chunk_count(
+uint32_t iceberg_bridge_get_file_chunk_count(
     const char *file_path,
     IcebergFileFormat format,
     IcebergError *error
@@ -378,12 +384,12 @@ uint32_t iceberg_get_file_chunk_count(
 /*
  * Check if format supports sub-file parallelism
  */
-bool iceberg_format_supports_chunks(IcebergFileFormat format);
+bool iceberg_bridge_format_supports_chunks(IcebergFileFormat format);
 
 /*
  * Get format name for logging
  */
-const char *iceberg_format_name(IcebergFileFormat format);
+const char *iceberg_bridge_format_name(IcebergFileFormat format);
 
 #ifdef __cplusplus
 }

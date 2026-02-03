@@ -80,10 +80,13 @@ set_target_properties(${EXTENSION_NAME} PROPERTIES
 
 # Link against iceberg-cpp when available
 if(ICEBERG_CPP_AVAILABLE)
-    # iceberg-cpp with bundled Arrow
+    # iceberg-cpp with bundled Arrow (use _static target)
     target_link_libraries(${EXTENSION_NAME} PRIVATE
-        iceberg_bundle
+        iceberg_bundle_static
     )
+
+    # Ensure iceberg-cpp is built before pg_lakehouse_iceberg
+    add_dependencies(${EXTENSION_NAME} iceberg_bundle_static)
 
     # Include iceberg-cpp headers
     target_include_directories(${EXTENSION_NAME} PRIVATE
@@ -94,7 +97,7 @@ if(ICEBERG_CPP_AVAILABLE)
         HAVE_ICEBERG_CPP
     )
 
-    message(STATUS "pg_lakehouse_iceberg: linking with iceberg-cpp")
+    message(STATUS "pg_lakehouse_iceberg: linking with iceberg_bundle_static")
 else()
     message(WARNING "pg_lakehouse_iceberg: iceberg-cpp not available, scan will return no data")
 endif()

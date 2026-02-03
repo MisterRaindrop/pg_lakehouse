@@ -189,7 +189,7 @@ static void release_arrow_stream(IcebergScanHandle *scan)
  * Initialize the iceberg-cpp library
  */
 extern "C" int
-iceberg_init(IcebergError *error)
+iceberg_bridge_init(IcebergError *error)
 {
     if (g_initialized) {
         return 0;
@@ -216,7 +216,7 @@ iceberg_init(IcebergError *error)
  * Cleanup the iceberg-cpp library
  */
 extern "C" void
-iceberg_shutdown(void)
+iceberg_bridge_shutdown(void)
 {
     if (!g_initialized) return;
 
@@ -228,7 +228,7 @@ iceberg_shutdown(void)
  * Open an Iceberg table
  */
 extern "C" IcebergTableHandle *
-iceberg_table_open(const char *location,
+iceberg_bridge_table_open(const char *location,
                    const char *catalog_type,
                    const char *catalog_uri,
                    IcebergError *error)
@@ -274,7 +274,7 @@ iceberg_table_open(const char *location,
                 properties);
 
             // Try to register and load the table
-            auto table_id = iceberg::TableIdentifier{.name = "imported_table"};
+            auto table_id = iceberg::TableIdentifier{.ns = {}, .name = "imported_table"};
             auto register_result = handle->catalog->RegisterTable(
                 table_id, handle->location);
             if (!register_result.has_value()) {
@@ -326,7 +326,7 @@ iceberg_table_open(const char *location,
  * Close an Iceberg table handle
  */
 extern "C" void
-iceberg_table_close(IcebergTableHandle *table)
+iceberg_bridge_table_close(IcebergTableHandle *table)
 {
     delete table;
 }
@@ -335,7 +335,7 @@ iceberg_table_close(IcebergTableHandle *table)
  * Get table metadata
  */
 extern "C" int
-iceberg_table_get_info(IcebergTableHandle *table,
+iceberg_bridge_table_get_info(IcebergTableHandle *table,
                        IcebergTableInfo *info,
                        IcebergError *error)
 {
@@ -398,11 +398,11 @@ iceberg_table_get_info(IcebergTableHandle *table,
  * Begin a table scan
  */
 extern "C" IcebergScanHandle *
-iceberg_scan_begin(IcebergTableHandle *table,
-                   int64_t snapshot_id,
-                   const char **column_names,
-                   int num_columns,
-                   IcebergError *error)
+iceberg_bridge_scan_begin(IcebergTableHandle *table,
+                          int64_t snapshot_id,
+                          const char **column_names,
+                          int num_columns,
+                          IcebergError *error)
 {
     if (!table || !table->table) {
         set_error(error, 1, "Invalid table handle");
@@ -564,7 +564,7 @@ static void convert_arrow_value(const ArrowArray *array,
         const uint8_t *validity = static_cast<const uint8_t *>(array->buffers[0]);
         int64_t idx = row + array->offset;
         if (!(validity[idx / 8] & (1 << (idx % 8)))) {
-            value->type = ICEBERG_NULL;
+            value->type = ICEBERG_TYPE_NULL;
             value->is_null = true;
             return;
         }
@@ -575,7 +575,7 @@ static void convert_arrow_value(const ArrowArray *array,
     // Parse format string to determine type
     const char *format = schema->format;
     if (!format) {
-        value->type = ICEBERG_NULL;
+        value->type = ICEBERG_TYPE_NULL;
         value->is_null = true;
         return;
     }
@@ -585,36 +585,36 @@ static void convert_arrow_value(const ArrowArray *array,
     if (strcmp(format, "b") == 0) {
         // Boolean
         const uint8_t *data = static_cast<const uint8_t *>(array->buffers[1]);
-        value->type = ICEBERG_BOOL;
+        value->type = ICEBERG_TYPE_BOOL;
         value->value.bool_val = (data[idx / 8] & (1 << (idx % 8))) != 0;
     }
     else if (strcmp(format, "i") == 0) {
         // Int32
         const int32_t *data = static_cast<const int32_t *>(array->buffers[1]);
-        value->type = ICEBERG_INT32;
+        value->type = ICEBERG_TYPE_INT32;
         value->value.int32_val = data[idx];
     }
     else if (strcmp(format, "l") == 0) {
         // Int64
         const int64_t *data = static_cast<const int64_t *>(array->buffers[1]);
-        value->type = ICEBERG_INT64;
+        value->type = ICEBERG_TYPE_INT64;
         value->value.int64_val = data[idx];
     }
     else if (strcmp(format, "f") == 0) {
         // Float
         const float *data = static_cast<const float *>(array->buffers[1]);
-        value->type = ICEBERG_FLOAT;
+        value->type = ICEBERG_TYPE_FLOAT;
         value->value.float_val = data[idx];
     }
     else if (strcmp(format, "g") == 0) {
         // Double
         const double *data = static_cast<const double *>(array->buffers[1]);
-        value->type = ICEBERG_DOUBLE;
+        value->type = ICEBERG_TYPE_DOUBLE;
         value->value.double_val = data[idx];
     }
     else if (strcmp(format, "u") == 0 || strcmp(format, "U") == 0) {
         // String (utf8 or large_utf8)
-        value->type = ICEBERG_STRING;
+        value->type = ICEBERG_TYPE_STRING;
         if (strcmp(format, "u") == 0) {
             const int32_t *offsets = static_cast<const int32_t *>(array->buffers[1]);
             const char *data = static_cast<const char *>(array->buffers[2]);
@@ -629,7 +629,7 @@ static void convert_arrow_value(const ArrowArray *array,
     }
     else if (strcmp(format, "z") == 0 || strcmp(format, "Z") == 0) {
         // Binary
-        value->type = ICEBERG_BINARY;
+        value->type = ICEBERG_TYPE_BINARY;
         if (strcmp(format, "z") == 0) {
             const int32_t *offsets = static_cast<const int32_t *>(array->buffers[1]);
             const char *data = static_cast<const char *>(array->buffers[2]);
@@ -645,13 +645,13 @@ static void convert_arrow_value(const ArrowArray *array,
     else if (strcmp(format, "tdD") == 0) {
         // Date (days since epoch)
         const int32_t *data = static_cast<const int32_t *>(array->buffers[1]);
-        value->type = ICEBERG_DATE;
+        value->type = ICEBERG_TYPE_DATE;
         value->value.date_val = data[idx];
     }
     else if (strncmp(format, "ts", 2) == 0) {
         // Timestamp
         const int64_t *data = static_cast<const int64_t *>(array->buffers[1]);
-        value->type = ICEBERG_TIMESTAMP;
+        value->type = ICEBERG_TYPE_TIMESTAMP;
         // Convert based on unit (u=microseconds, n=nanoseconds, s=seconds, m=milliseconds)
         char unit = format[2];
         switch (unit) {
@@ -673,7 +673,7 @@ static void convert_arrow_value(const ArrowArray *array,
     }
     else {
         // Unknown type - treat as null for now
-        value->type = ICEBERG_NULL;
+        value->type = ICEBERG_TYPE_NULL;
         value->is_null = true;
     }
 }
@@ -682,10 +682,10 @@ static void convert_arrow_value(const ArrowArray *array,
  * Get next row from scan
  */
 extern "C" bool
-iceberg_scan_next(IcebergScanHandle *scan,
-                  IcebergValue *values,
-                  int num_cols,
-                  IcebergError *error)
+iceberg_bridge_scan_next(IcebergScanHandle *scan,
+                         IcebergValue *values,
+                         int num_cols,
+                         IcebergError *error)
 {
     if (!scan || !values) {
         set_error(error, 1, "Invalid arguments");
@@ -714,7 +714,7 @@ iceberg_scan_next(IcebergScanHandle *scan,
 
                 // Fill remaining columns with nulls
                 for (int i = scan->current_batch.n_children; i < num_cols; i++) {
-                    values[i].type = ICEBERG_NULL;
+                    values[i].type = ICEBERG_TYPE_NULL;
                     values[i].is_null = true;
                 }
 
@@ -744,7 +744,7 @@ iceberg_scan_next(IcebergScanHandle *scan,
  * End a table scan
  */
 extern "C" void
-iceberg_scan_end(IcebergScanHandle *scan)
+iceberg_bridge_scan_end(IcebergScanHandle *scan)
 {
     if (scan) {
         release_arrow_stream(scan);
@@ -756,7 +756,7 @@ iceberg_scan_end(IcebergScanHandle *scan)
  * Get column count
  */
 extern "C" int
-iceberg_table_get_column_count(IcebergTableHandle *table)
+iceberg_bridge_table_get_column_count(IcebergTableHandle *table)
 {
     if (!table) return 0;
     return static_cast<int>(table->column_names.size());
@@ -766,7 +766,7 @@ iceberg_table_get_column_count(IcebergTableHandle *table)
  * Get column name
  */
 extern "C" const char *
-iceberg_table_get_column_name(IcebergTableHandle *table, int column_index)
+iceberg_bridge_table_get_column_name(IcebergTableHandle *table, int column_index)
 {
     if (!table || column_index < 0 ||
         column_index >= static_cast<int>(table->column_names.size())) {
@@ -779,7 +779,7 @@ iceberg_table_get_column_name(IcebergTableHandle *table, int column_index)
  * Get column type
  */
 extern "C" const char *
-iceberg_table_get_column_type(IcebergTableHandle *table, int column_index)
+iceberg_bridge_table_get_column_type(IcebergTableHandle *table, int column_index)
 {
     if (!table || column_index < 0 ||
         column_index >= static_cast<int>(table->column_types.size())) {
@@ -840,7 +840,7 @@ static IcebergFileFormat convert_file_format(iceberg::FileFormatType format)
  * Detect file format from file path extension
  */
 extern "C" IcebergFileFormat
-iceberg_detect_file_format(const char *file_path)
+iceberg_bridge_detect_file_format(const char *file_path)
 {
     std::string ext = get_file_extension(file_path);
 
@@ -859,7 +859,7 @@ iceberg_detect_file_format(const char *file_path)
  * Check if format supports sub-file parallelism (row groups / stripes)
  */
 extern "C" bool
-iceberg_format_supports_chunks(IcebergFileFormat format)
+iceberg_bridge_format_supports_chunks(IcebergFileFormat format)
 {
     switch (format) {
         case ICEBERG_FORMAT_PARQUET:
@@ -876,7 +876,7 @@ iceberg_format_supports_chunks(IcebergFileFormat format)
  * Get format name for logging
  */
 extern "C" const char *
-iceberg_format_name(IcebergFileFormat format)
+iceberg_bridge_format_name(IcebergFileFormat format)
 {
     switch (format) {
         case ICEBERG_FORMAT_PARQUET: return "Parquet";
@@ -894,7 +894,7 @@ iceberg_format_name(IcebergFileFormat format)
  * Avro: returns 1 (file-level only)
  */
 extern "C" uint32_t
-iceberg_get_file_chunk_count(const char *file_path,
+iceberg_bridge_get_file_chunk_count(const char *file_path,
                               IcebergFileFormat format,
                               IcebergError *error)
 {
@@ -935,7 +935,7 @@ iceberg_get_file_chunk_count(const char *file_path,
  * Create a parallel scan plan
  */
 extern "C" IcebergParallelPlan *
-iceberg_parallel_plan_create(IcebergTableHandle *table,
+iceberg_bridge_parallel_plan_create(IcebergTableHandle *table,
                               int64_t snapshot_id,
                               IcebergError *error)
 {
@@ -993,7 +993,7 @@ iceberg_parallel_plan_create(IcebergTableHandle *table,
 
             // Get chunk count based on format
             IcebergFileFormat format = static_cast<IcebergFileFormat>(file_info.file_format);
-            file_info.chunk_count = iceberg_get_file_chunk_count(
+            file_info.chunk_count = iceberg_bridge_get_file_chunk_count(
                 file_info.path, format, error);
             if (file_info.chunk_count == 0) {
                 file_info.chunk_count = 1;
@@ -1002,7 +1002,7 @@ iceberg_parallel_plan_create(IcebergTableHandle *table,
             plan->files.push_back(file_info);
 
             // Create tasks based on chunk count
-            if (iceberg_format_supports_chunks(format) && file_info.chunk_count > 1) {
+            if (iceberg_bridge_format_supports_chunks(format) && file_info.chunk_count > 1) {
                 for (uint32_t chunk = 0; chunk < file_info.chunk_count; chunk++) {
                     IcebergParallelTask task_info = {};
                     task_info.file_index = static_cast<uint32_t>(i);
@@ -1034,7 +1034,7 @@ iceberg_parallel_plan_create(IcebergTableHandle *table,
  * Get size needed for serialized parallel state
  */
 extern "C" size_t
-iceberg_parallel_plan_get_size(IcebergParallelPlan *plan)
+iceberg_bridge_parallel_plan_get_size(IcebergParallelPlan *plan)
 {
     if (!plan) return 0;
 
@@ -1049,13 +1049,13 @@ iceberg_parallel_plan_get_size(IcebergParallelPlan *plan)
  * Serialize parallel plan to buffer
  */
 extern "C" size_t
-iceberg_parallel_plan_serialize(IcebergParallelPlan *plan,
+iceberg_bridge_parallel_plan_serialize(IcebergParallelPlan *plan,
                                  void *buffer,
                                  size_t size)
 {
     if (!plan || !buffer) return 0;
 
-    size_t needed = iceberg_parallel_plan_get_size(plan);
+    size_t needed = iceberg_bridge_parallel_plan_get_size(plan);
     if (size < needed) return 0;
 
     char *ptr = static_cast<char *>(buffer);
@@ -1089,7 +1089,7 @@ iceberg_parallel_plan_serialize(IcebergParallelPlan *plan,
  * Free parallel plan
  */
 extern "C" void
-iceberg_parallel_plan_free(IcebergParallelPlan *plan)
+iceberg_bridge_parallel_plan_free(IcebergParallelPlan *plan)
 {
     delete plan;
 }
@@ -1098,7 +1098,7 @@ iceberg_parallel_plan_free(IcebergParallelPlan *plan)
  * Get file count from plan
  */
 extern "C" uint32_t
-iceberg_parallel_plan_get_file_count(IcebergParallelPlan *plan)
+iceberg_bridge_parallel_plan_get_file_count(IcebergParallelPlan *plan)
 {
     return plan ? static_cast<uint32_t>(plan->files.size()) : 0;
 }
@@ -1107,7 +1107,7 @@ iceberg_parallel_plan_get_file_count(IcebergParallelPlan *plan)
  * Get task count from plan
  */
 extern "C" uint32_t
-iceberg_parallel_plan_get_task_count(IcebergParallelPlan *plan)
+iceberg_bridge_parallel_plan_get_task_count(IcebergParallelPlan *plan)
 {
     return plan ? static_cast<uint32_t>(plan->tasks.size()) : 0;
 }
@@ -1116,7 +1116,7 @@ iceberg_parallel_plan_get_task_count(IcebergParallelPlan *plan)
  * Get file info from serialized state
  */
 extern "C" const IcebergFileInfo *
-iceberg_parallel_state_get_file(const IcebergParallelState *state,
+iceberg_bridge_parallel_state_get_file(const IcebergParallelState *state,
                                  uint32_t file_index)
 {
     if (!state || state->magic != ICEBERG_PARALLEL_MAGIC) return nullptr;
@@ -1133,7 +1133,7 @@ iceberg_parallel_state_get_file(const IcebergParallelState *state,
  * Get task from serialized state
  */
 extern "C" const IcebergParallelTask *
-iceberg_parallel_state_get_task(const IcebergParallelState *state,
+iceberg_bridge_parallel_state_get_task(const IcebergParallelState *state,
                                  uint32_t task_index)
 {
     if (!state || state->magic != ICEBERG_PARALLEL_MAGIC) return nullptr;
@@ -1151,7 +1151,7 @@ iceberg_parallel_state_get_task(const IcebergParallelState *state,
  * Begin parallel scan for a specific task
  */
 extern "C" IcebergScanHandle *
-iceberg_parallel_scan_begin(IcebergTableHandle *table,
+iceberg_bridge_parallel_scan_begin(IcebergTableHandle *table,
                              const IcebergParallelState *state,
                              uint32_t task_index,
                              IcebergError *error)
@@ -1161,13 +1161,13 @@ iceberg_parallel_scan_begin(IcebergTableHandle *table,
         return nullptr;
     }
 
-    const IcebergParallelTask *task = iceberg_parallel_state_get_task(state, task_index);
+    const IcebergParallelTask *task = iceberg_bridge_parallel_state_get_task(state, task_index);
     if (!task) {
         set_error(error, 1, "Invalid task index");
         return nullptr;
     }
 
-    const IcebergFileInfo *file = iceberg_parallel_state_get_file(state, task->file_index);
+    const IcebergFileInfo *file = iceberg_bridge_parallel_state_get_file(state, task->file_index);
     if (!file) {
         set_error(error, 1, "Invalid file index");
         return nullptr;
@@ -1232,7 +1232,7 @@ iceberg_parallel_scan_begin(IcebergTableHandle *table,
  * Stub implementations when iceberg-cpp is not available
  */
 
-extern "C" int iceberg_init(IcebergError *error)
+extern "C" int iceberg_bridge_init(IcebergError *error)
 {
     if (error) {
         error->code = 1;
@@ -1241,13 +1241,13 @@ extern "C" int iceberg_init(IcebergError *error)
     return 1;
 }
 
-extern "C" void iceberg_shutdown(void) {}
+extern "C" void iceberg_bridge_shutdown(void) {}
 
 extern "C" IcebergTableHandle *
-iceberg_table_open(const char *location,
-                   const char *catalog_type,
-                   const char *catalog_uri,
-                   IcebergError *error)
+iceberg_bridge_table_open(const char *location,
+                          const char *catalog_type,
+                          const char *catalog_uri,
+                          IcebergError *error)
 {
     if (error) {
         error->code = 1;
@@ -1256,50 +1256,50 @@ iceberg_table_open(const char *location,
     return nullptr;
 }
 
-extern "C" void iceberg_table_close(IcebergTableHandle *table) {}
+extern "C" void iceberg_bridge_table_close(IcebergTableHandle *table) {}
 
 extern "C" int
-iceberg_table_get_info(IcebergTableHandle *table,
-                       IcebergTableInfo *info,
-                       IcebergError *error)
+iceberg_bridge_table_get_info(IcebergTableHandle *table,
+                              IcebergTableInfo *info,
+                              IcebergError *error)
 {
     return 1;
 }
 
 extern "C" IcebergScanHandle *
-iceberg_scan_begin(IcebergTableHandle *table,
-                   int64_t snapshot_id,
-                   const char **column_names,
-                   int num_columns,
-                   IcebergError *error)
+iceberg_bridge_scan_begin(IcebergTableHandle *table,
+                          int64_t snapshot_id,
+                          const char **column_names,
+                          int num_columns,
+                          IcebergError *error)
 {
     return nullptr;
 }
 
 extern "C" bool
-iceberg_scan_next(IcebergScanHandle *scan,
-                  IcebergValue *values,
-                  int num_cols,
-                  IcebergError *error)
+iceberg_bridge_scan_next(IcebergScanHandle *scan,
+                         IcebergValue *values,
+                         int num_cols,
+                         IcebergError *error)
 {
     return false;
 }
 
-extern "C" void iceberg_scan_end(IcebergScanHandle *scan) {}
+extern "C" void iceberg_bridge_scan_end(IcebergScanHandle *scan) {}
 
-extern "C" int iceberg_table_get_column_count(IcebergTableHandle *table)
+extern "C" int iceberg_bridge_table_get_column_count(IcebergTableHandle *table)
 {
     return 0;
 }
 
 extern "C" const char *
-iceberg_table_get_column_name(IcebergTableHandle *table, int column_index)
+iceberg_bridge_table_get_column_name(IcebergTableHandle *table, int column_index)
 {
     return nullptr;
 }
 
 extern "C" const char *
-iceberg_table_get_column_type(IcebergTableHandle *table, int column_index)
+iceberg_bridge_table_get_column_type(IcebergTableHandle *table, int column_index)
 {
     return nullptr;
 }
@@ -1307,83 +1307,83 @@ iceberg_table_get_column_type(IcebergTableHandle *table, int column_index)
 /* Parallel scan stubs */
 
 extern "C" IcebergFileFormat
-iceberg_detect_file_format(const char *file_path)
+iceberg_bridge_detect_file_format(const char *file_path)
 {
     return ICEBERG_FORMAT_UNKNOWN;
 }
 
 extern "C" bool
-iceberg_format_supports_chunks(IcebergFileFormat format)
+iceberg_bridge_format_supports_chunks(IcebergFileFormat format)
 {
     return false;
 }
 
 extern "C" const char *
-iceberg_format_name(IcebergFileFormat format)
+iceberg_bridge_format_name(IcebergFileFormat format)
 {
     return "Unknown";
 }
 
 extern "C" uint32_t
-iceberg_get_file_chunk_count(const char *file_path,
-                              IcebergFileFormat format,
-                              IcebergError *error)
+iceberg_bridge_get_file_chunk_count(const char *file_path,
+                                    IcebergFileFormat format,
+                                    IcebergError *error)
 {
     return 0;
 }
 
 extern "C" IcebergParallelPlan *
-iceberg_parallel_plan_create(IcebergTableHandle *table,
-                              int64_t snapshot_id,
-                              IcebergError *error)
+iceberg_bridge_parallel_plan_create(IcebergTableHandle *table,
+                                    int64_t snapshot_id,
+                                    IcebergError *error)
 {
     return nullptr;
 }
 
-extern "C" size_t iceberg_parallel_plan_get_size(IcebergParallelPlan *plan)
+extern "C" size_t iceberg_bridge_parallel_plan_get_size(IcebergParallelPlan *plan)
 {
     return 0;
 }
 
 extern "C" size_t
-iceberg_parallel_plan_serialize(IcebergParallelPlan *plan,
-                                 void *buffer,
-                                 size_t size)
+iceberg_bridge_parallel_plan_serialize(IcebergParallelPlan *plan,
+                                       void *buffer,
+                                       size_t size)
 {
     return 0;
 }
 
-extern "C" void iceberg_parallel_plan_free(IcebergParallelPlan *plan) {}
+extern "C" void iceberg_bridge_parallel_plan_free(IcebergParallelPlan *plan) {}
 
-extern "C" uint32_t iceberg_parallel_plan_get_file_count(IcebergParallelPlan *plan)
+extern "C" uint32_t iceberg_bridge_parallel_plan_get_file_count(IcebergParallelPlan *plan)
 {
     return 0;
 }
 
-extern "C" uint32_t iceberg_parallel_plan_get_task_count(IcebergParallelPlan *plan)
+extern "C" uint32_t iceberg_bridge_parallel_plan_get_task_count(IcebergParallelPlan *plan)
 {
     return 0;
 }
 
 extern "C" const IcebergFileInfo *
-iceberg_parallel_state_get_file(const IcebergParallelState *state,
-                                 uint32_t file_index)
+iceberg_bridge_parallel_state_get_file(const IcebergParallelState *state,
+                                       uint32_t file_index)
 {
     return nullptr;
 }
 
 extern "C" const IcebergParallelTask *
-iceberg_parallel_state_get_task(const IcebergParallelState *state,
-                                 uint32_t task_index)
+iceberg_bridge_parallel_state_get_task(const IcebergParallelState *state,
+                                       uint32_t task_index)
 {
     return nullptr;
 }
 
 extern "C" IcebergScanHandle *
-iceberg_parallel_scan_begin(IcebergTableHandle *table,
-                             const IcebergParallelState *state,
-                             uint32_t task_index,
-                             IcebergError *error)
+iceberg_bridge_parallel_scan_begin(IcebergTableHandle *table,
+                                   const IcebergParallelState *state,
+                                   uint32_t task_index,
+                                   IcebergError *error)
 {
     return nullptr;
 }

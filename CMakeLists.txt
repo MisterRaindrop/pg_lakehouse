@@ -51,10 +51,8 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
 endif()
 
-# Compiler warnings
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    add_compile_options(-Wall -Wextra -Wpedantic)
-endif()
+# Compiler warnings (applied only to our code, not thirdparty)
+# Note: We set these per-target instead of globally to avoid affecting thirdparty code
 
 # ============================================================================
 # Find PostgreSQL
@@ -105,7 +103,24 @@ if(PG_LAKEHOUSE_BUILD_ICEBERG AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty
     set(ICEBERG_BUILD_BUNDLE ON CACHE BOOL "" FORCE)
     set(ICEBERG_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 
+    # Disable warnings-as-errors for thirdparty code (iceberg-cpp sets CMAKE_COMPILE_WARNING_AS_ERROR)
+    set(CMAKE_COMPILE_WARNING_AS_ERROR OFF CACHE BOOL "" FORCE)
+
     add_subdirectory(thirdparty/iceberg-cpp EXCLUDE_FROM_ALL)
+
+    # iceberg-cpp's own top-level CMakeLists.txt force-enables warnings-as-errors via
+    # `set(CMAKE_COMPILE_WARNING_AS_ERROR ON)`, which can break the build on newer
+    # compilers (e.g. GCC 14) due to thirdparty warnings being promoted to errors.
+    # Keep warnings-as-errors for our code, but disable it for iceberg-cpp targets.
+    foreach(_tgt IN ITEMS
+        iceberg_static iceberg_shared
+        iceberg_bundle_static iceberg_bundle_shared
+        iceberg_rest_static iceberg_rest_shared
+    )
+        if(TARGET ${_tgt})
+            set_property(TARGET ${_tgt} PROPERTY COMPILE_WARNING_AS_ERROR OFF)
+        endif()
+    endforeach()
     set(ICEBERG_CPP_AVAILABLE TRUE)
 else()
     message(STATUS "iceberg-cpp not found in thirdparty/, will try find_package")
