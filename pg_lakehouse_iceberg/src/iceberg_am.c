@@ -52,6 +52,19 @@ PG_MODULE_MAGIC;
 /* TODO: Add configuration variables like default S3 endpoint, etc. */
 
 /*
+ * Iceberg parallel scan shared state (stored in DSM)
+ * This wraps the IcebergParallelState from the bridge plus atomic counter
+ */
+typedef struct IcebergParallelScanDescData
+{
+    pg_atomic_uint32    next_task;      /* Next task to assign (atomic) */
+    uint32              initialized;    /* Magic to verify initialization */
+    /* IcebergParallelState follows (variable length) */
+} IcebergParallelScanDescData;
+
+#define ICEBERG_PSCAN_MAGIC 0x49435053  /* "ICPS" */
+
+/*
  * Iceberg scan descriptor - holds state for table scans
  */
 typedef struct IcebergScanDescData
@@ -63,12 +76,20 @@ typedef struct IcebergScanDescData
     int64       current_row;
     int64       total_rows;
 
+    /* Parallel scan state (per-worker) */
+    bool        is_parallel;
+    uint32      current_task_id;    /* Current task being processed */
+    bool        task_exhausted;     /* Current task has no more rows */
+
 #ifdef HAVE_ICEBERG_CPP
     /* iceberg-cpp bridge handles */
     IcebergTableHandle *table_handle;
     IcebergScanHandle  *scan_handle;
     IcebergValue       *row_values;
     int                 num_columns;
+
+    /* Parallel plan (only set for leader during planning) */
+    IcebergParallelPlan *parallel_plan;
 #endif
 
 } IcebergScanDescData;
@@ -103,6 +124,11 @@ iceberg_scan_begin(Relation relation, Snapshot snapshot,
     scan->current_row = 0;
     scan->total_rows = 0;
 
+    /* Initialize parallel scan state */
+    scan->is_parallel = (parallel_scan != NULL);
+    scan->current_task_id = 0;
+    scan->task_exhausted = true;  /* Force getting first task */
+
 #ifdef HAVE_ICEBERG_CPP
     {
         IcebergError error = {0};
@@ -130,23 +156,31 @@ iceberg_scan_begin(Relation relation, Snapshot snapshot,
             scan->row_values = (IcebergValue *)
                 palloc0(sizeof(IcebergValue) * scan->num_columns);
 
-            /* Begin the scan */
-            scan->scan_handle = iceberg_scan_begin(scan->table_handle,
-                                                    0, /* latest snapshot */
-                                                    NULL, /* all columns */
-                                                    0,
-                                                    &error);
-            if (scan->scan_handle == NULL)
+            /*
+             * For parallel scans, don't start the scan here.
+             * Each worker will get tasks and open scans in getnextslot.
+             *
+             * For serial scans, start the scan immediately.
+             */
+            if (!scan->is_parallel)
             {
-                elog(WARNING, "iceberg_scan_begin: failed to begin scan: %s",
-                     error.message);
+                scan->scan_handle = iceberg_scan_begin(scan->table_handle,
+                                                        0, /* latest snapshot */
+                                                        NULL, /* all columns */
+                                                        0,
+                                                        &error);
+                if (scan->scan_handle == NULL)
+                {
+                    elog(WARNING, "iceberg_scan_begin: failed to begin scan: %s",
+                         error.message);
+                }
             }
         }
     }
 #endif
 
-    elog(DEBUG1, "iceberg_scan_begin: relation=%s",
-         RelationGetRelationName(relation));
+    elog(DEBUG1, "iceberg_scan_begin: relation=%s, parallel=%d",
+         RelationGetRelationName(relation), scan->is_parallel);
 
     return (TableScanDesc) scan;
 }
@@ -179,23 +213,201 @@ iceberg_scan_rescan(TableScanDesc sscan, ScanKey key, bool set_params,
 {
     IcebergScanDesc scan = (IcebergScanDesc) sscan;
 
-    elog(DEBUG1, "iceberg_scan_rescan");
+    elog(DEBUG1, "iceberg_scan_rescan: parallel=%d", scan->is_parallel);
 
     scan->scan_started = false;
     scan->current_row = 0;
 
 #ifdef HAVE_ICEBERG_CPP
-    /* Close and reopen scan to reset position */
+    /* Close current scan handle */
     if (scan->scan_handle)
     {
-        IcebergError error = {0};
-
         iceberg_scan_end(scan->scan_handle);
+        scan->scan_handle = NULL;
+    }
+
+    if (scan->is_parallel)
+    {
+        /*
+         * For parallel scans, reset task state.
+         * The shared next_task counter is reset by parallelscan_reinitialize.
+         */
+        scan->current_task_id = 0;
+        scan->task_exhausted = true;
+    }
+    else
+    {
+        /* For serial scans, reopen the scan */
+        IcebergError error = {0};
         scan->scan_handle = iceberg_scan_begin(scan->table_handle,
                                                 0, NULL, 0, &error);
     }
 #endif
 }
+
+/*
+ * Helper function to convert IcebergValue to PostgreSQL Datum
+ */
+#ifdef HAVE_ICEBERG_CPP
+static bool
+iceberg_convert_values_to_slot(IcebergScanDesc scan, TupleTableSlot *slot)
+{
+    TupleDesc tupdesc = RelationGetDescr(scan->rs_base.rs_rd);
+    int natts = tupdesc->natts;
+    Datum *values = slot->tts_values;
+    bool *isnull = slot->tts_isnull;
+    int i;
+
+    /* Convert IcebergValue to PostgreSQL Datum */
+    for (i = 0; i < natts; i++)
+    {
+        Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+        IcebergValue *val = &scan->row_values[i];
+
+        if (val->is_null)
+        {
+            isnull[i] = true;
+            values[i] = (Datum) 0;
+        }
+        else
+        {
+            isnull[i] = false;
+
+            /*
+             * Convert based on PostgreSQL target type
+             */
+            switch (attr->atttypid)
+            {
+                case INT8OID:
+                    values[i] = Int64GetDatum(val->value.int64_val);
+                    break;
+                case INT4OID:
+                    values[i] = Int32GetDatum(val->value.int32_val);
+                    break;
+                case FLOAT8OID:
+                    values[i] = Float8GetDatum(val->value.double_val);
+                    break;
+                case FLOAT4OID:
+                    values[i] = Float4GetDatum(val->value.float_val);
+                    break;
+                case BOOLOID:
+                    values[i] = BoolGetDatum(val->value.bool_val);
+                    break;
+                case TEXTOID:
+                case VARCHAROID:
+                    if (val->value.string_val.data)
+                    {
+                        values[i] = PointerGetDatum(
+                            cstring_to_text_with_len(
+                                val->value.string_val.data,
+                                val->value.string_val.len));
+                    }
+                    else
+                    {
+                        isnull[i] = true;
+                        values[i] = (Datum) 0;
+                    }
+                    break;
+                case TIMESTAMPOID:
+                    /* Iceberg timestamp is microseconds since epoch */
+                    values[i] = TimestampGetDatum(
+                        val->value.timestamp_val -
+                        ((POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) *
+                         USECS_PER_DAY));
+                    break;
+                default:
+                    /* Unsupported type - return null */
+                    elog(WARNING, "iceberg_scan: unsupported type %u for column %s",
+                         attr->atttypid, NameStr(attr->attname));
+                    isnull[i] = true;
+                    values[i] = (Datum) 0;
+                    break;
+            }
+        }
+    }
+
+    scan->current_row++;
+    ExecStoreVirtualTuple(slot);
+    return true;
+}
+
+/*
+ * Get next task for parallel scan
+ * Returns task_id, or UINT32_MAX if no more tasks
+ */
+static uint32
+iceberg_parallel_get_next_task(IcebergScanDesc scan)
+{
+    IcebergParallelScanDescData *pscan;
+    const IcebergParallelState *state;
+    uint32 task_id;
+
+    if (!scan->rs_base.rs_parallel)
+        return UINT32_MAX;
+
+    pscan = (IcebergParallelScanDescData *) scan->rs_base.rs_parallel;
+
+    if (pscan->initialized != ICEBERG_PSCAN_MAGIC)
+        return UINT32_MAX;
+
+    /* Get shared state (follows the header) */
+    state = (const IcebergParallelState *)
+        ((char *) pscan + sizeof(IcebergParallelScanDescData));
+
+    /* Atomically get next task */
+    task_id = pg_atomic_fetch_add_u32(&pscan->next_task, 1);
+
+    if (task_id >= state->total_tasks)
+        return UINT32_MAX;
+
+    elog(DEBUG2, "iceberg_parallel_get_next_task: worker got task %u of %u",
+         task_id, state->total_tasks);
+
+    return task_id;
+}
+
+/*
+ * Open scan for a specific parallel task
+ */
+static bool
+iceberg_parallel_open_task(IcebergScanDesc scan, uint32 task_id)
+{
+    IcebergParallelScanDescData *pscan;
+    const IcebergParallelState *state;
+    IcebergError error = {0};
+
+    pscan = (IcebergParallelScanDescData *) scan->rs_base.rs_parallel;
+    state = (const IcebergParallelState *)
+        ((char *) pscan + sizeof(IcebergParallelScanDescData));
+
+    /* Close previous task's scan if any */
+    if (scan->scan_handle)
+    {
+        iceberg_scan_end(scan->scan_handle);
+        scan->scan_handle = NULL;
+    }
+
+    /* Open scan for this task */
+    scan->scan_handle = iceberg_parallel_scan_begin(
+        scan->table_handle,
+        state,
+        task_id,
+        &error
+    );
+
+    if (!scan->scan_handle)
+    {
+        elog(WARNING, "iceberg_parallel_open_task: failed to open task %u: %s",
+             task_id, error.message);
+        return false;
+    }
+
+    scan->current_task_id = task_id;
+    scan->task_exhausted = false;
+
+    return true;
+}
+#endif /* HAVE_ICEBERG_CPP */
 
 static bool
 iceberg_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
@@ -203,98 +415,67 @@ iceberg_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
 {
     IcebergScanDesc scan = (IcebergScanDesc) sscan;
 
-    elog(DEBUG1, "iceberg_scan_getnextslot: row=%ld", scan->current_row);
+    elog(DEBUG2, "iceberg_scan_getnextslot: row=%ld, is_parallel=%d",
+         scan->current_row, scan->is_parallel);
 
     /* Clear any previous tuple */
     ExecClearTuple(slot);
 
 #ifdef HAVE_ICEBERG_CPP
-    if (scan->scan_handle && scan->row_values)
+    if (!scan->row_values || !scan->table_handle)
+        return false;
+
+    /*
+     * Parallel scan path
+     */
+    if (scan->is_parallel)
     {
         IcebergError error = {0};
-        TupleDesc tupdesc = RelationGetDescr(scan->rs_base.rs_rd);
-        int natts = tupdesc->natts;
-        Datum *values = slot->tts_values;
-        bool *isnull = slot->tts_isnull;
+        int natts = RelationGetNumberOfAttributes(scan->rs_base.rs_rd);
 
-        /* Get next row from iceberg-cpp */
-        if (iceberg_scan_next(scan->scan_handle, scan->row_values,
-                              natts, &error))
+        for (;;)
         {
-            int i;
-
-            /* Convert IcebergValue to PostgreSQL Datum */
-            for (i = 0; i < natts; i++)
+            /* Try to get a row from current task */
+            if (scan->scan_handle && !scan->task_exhausted)
             {
-                Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
-                IcebergValue *val = &scan->row_values[i];
-
-                if (val->is_null)
+                if (iceberg_scan_next(scan->scan_handle, scan->row_values,
+                                      natts, &error))
                 {
-                    isnull[i] = true;
-                    values[i] = (Datum) 0;
+                    return iceberg_convert_values_to_slot(scan, slot);
                 }
-                else
-                {
-                    isnull[i] = false;
-
-                    /*
-                     * Convert based on PostgreSQL target type
-                     * TODO: Add more type conversions
-                     */
-                    switch (attr->atttypid)
-                    {
-                        case INT8OID:
-                            values[i] = Int64GetDatum(val->value.int64_val);
-                            break;
-                        case INT4OID:
-                            values[i] = Int32GetDatum(val->value.int32_val);
-                            break;
-                        case FLOAT8OID:
-                            values[i] = Float8GetDatum(val->value.double_val);
-                            break;
-                        case FLOAT4OID:
-                            values[i] = Float4GetDatum(val->value.float_val);
-                            break;
-                        case BOOLOID:
-                            values[i] = BoolGetDatum(val->value.bool_val);
-                            break;
-                        case TEXTOID:
-                        case VARCHAROID:
-                            if (val->value.string_val.data)
-                            {
-                                values[i] = PointerGetDatum(
-                                    cstring_to_text_with_len(
-                                        val->value.string_val.data,
-                                        val->value.string_val.len));
-                            }
-                            else
-                            {
-                                isnull[i] = true;
-                                values[i] = (Datum) 0;
-                            }
-                            break;
-                        case TIMESTAMPOID:
-                            /* Iceberg timestamp is microseconds since epoch */
-                            values[i] = TimestampGetDatum(
-                                val->value.timestamp_val -
-                                ((POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) *
-                                 USECS_PER_DAY));
-                            break;
-                        default:
-                            /* Unsupported type - return null */
-                            elog(WARNING, "iceberg_scan: unsupported type %u for column %s",
-                                 attr->atttypid, NameStr(attr->attname));
-                            isnull[i] = true;
-                            values[i] = (Datum) 0;
-                            break;
-                    }
-                }
+                /* Current task exhausted */
+                scan->task_exhausted = true;
             }
 
-            scan->current_row++;
-            ExecStoreVirtualTuple(slot);
-            return true;
+            /* Get next task */
+            uint32 task_id = iceberg_parallel_get_next_task(scan);
+            if (task_id == UINT32_MAX)
+            {
+                /* No more tasks */
+                return false;
+            }
+
+            /* Open the new task */
+            if (!iceberg_parallel_open_task(scan, task_id))
+            {
+                /* Failed to open task, try next one */
+                scan->task_exhausted = true;
+                continue;
+            }
+        }
+    }
+
+    /*
+     * Serial scan path
+     */
+    if (scan->scan_handle)
+    {
+        IcebergError error = {0};
+        int natts = RelationGetNumberOfAttributes(scan->rs_base.rs_rd);
+
+        if (iceberg_scan_next(scan->scan_handle, scan->row_values, natts, &error))
+        {
+            return iceberg_convert_values_to_slot(scan, slot);
         }
     }
 #endif
@@ -566,19 +747,133 @@ iceberg_index_validate_scan(Relation tableRelation,
 static Size
 iceberg_parallelscan_estimate(Relation rel)
 {
-    /* TODO: Implement parallel scan support */
+#ifdef HAVE_ICEBERG_CPP
+    Size        size;
+
+    /*
+     * Estimate the size needed for parallel scan state.
+     * This is called during planning to determine how much shared memory
+     * to allocate in the DSM segment.
+     *
+     * We need:
+     * - IcebergParallelScanDescData header (with atomic counter)
+     * - IcebergParallelState (header + files + tasks)
+     *
+     * We estimate conservatively since we don't know exact file count yet.
+     */
+    size = sizeof(IcebergParallelScanDescData);
+
+    /*
+     * Estimate for typical Iceberg table:
+     * - Up to 1000 files
+     * - Up to 10 row groups per file = 10000 tasks
+     * This is just an estimate; actual size computed in initialize.
+     */
+    size += sizeof(IcebergParallelState);
+    size += 1000 * sizeof(IcebergFileInfo);
+    size += 10000 * sizeof(IcebergParallelTask);
+
+    elog(DEBUG1, "iceberg_parallelscan_estimate: size=%zu", size);
+
+    return size;
+#else
     return 0;
+#endif
 }
 
 static Size
 iceberg_parallelscan_initialize(Relation rel, ParallelTableScanDesc pscan)
 {
+#ifdef HAVE_ICEBERG_CPP
+    IcebergParallelScanDescData *ipscan = (IcebergParallelScanDescData *) pscan;
+    IcebergError error = {0};
+    IcebergTableHandle *table;
+    IcebergParallelPlan *plan;
+    Size actual_size;
+    char *state_buffer;
+
+    elog(DEBUG1, "iceberg_parallelscan_initialize: relation=%s",
+         RelationGetRelationName(rel));
+
+    /*
+     * Initialize the atomic task counter
+     */
+    pg_atomic_init_u32(&ipscan->next_task, 0);
+
+    /*
+     * Open the Iceberg table to get file list
+     * TODO: Get table options from relation
+     */
+    table = iceberg_table_open(NULL, NULL, NULL, &error);
+    if (!table)
+    {
+        elog(WARNING, "iceberg_parallelscan_initialize: failed to open table: %s",
+             error.message);
+        ipscan->initialized = 0;
+        return sizeof(IcebergParallelScanDescData);
+    }
+
+    /*
+     * Create parallel scan plan (analyzes files, creates tasks)
+     */
+    plan = iceberg_parallel_plan_create(table, 0 /* latest snapshot */, &error);
+    if (!plan)
+    {
+        elog(WARNING, "iceberg_parallelscan_initialize: failed to create plan: %s",
+             error.message);
+        iceberg_table_close(table);
+        ipscan->initialized = 0;
+        return sizeof(IcebergParallelScanDescData);
+    }
+
+    /*
+     * Serialize the plan to shared memory (after header)
+     */
+    state_buffer = (char *) pscan + sizeof(IcebergParallelScanDescData);
+    actual_size = iceberg_parallel_plan_serialize(
+        plan,
+        state_buffer,
+        iceberg_parallel_plan_get_size(plan)
+    );
+
+    elog(DEBUG1, "iceberg_parallelscan_initialize: files=%u, tasks=%u, size=%zu",
+         iceberg_parallel_plan_get_file_count(plan),
+         iceberg_parallel_plan_get_task_count(plan),
+         actual_size);
+
+    /*
+     * Cleanup
+     */
+    iceberg_parallel_plan_free(plan);
+    iceberg_table_close(table);
+
+    /*
+     * Mark as initialized
+     */
+    ipscan->initialized = ICEBERG_PSCAN_MAGIC;
+
+    return sizeof(IcebergParallelScanDescData) + actual_size;
+#else
     return 0;
+#endif
 }
 
 static void
 iceberg_parallelscan_reinitialize(Relation rel, ParallelTableScanDesc pscan)
 {
+#ifdef HAVE_ICEBERG_CPP
+    IcebergParallelScanDescData *ipscan = (IcebergParallelScanDescData *) pscan;
+
+    elog(DEBUG1, "iceberg_parallelscan_reinitialize");
+
+    /*
+     * Reset the task counter to 0 for rescan
+     */
+    if (ipscan->initialized == ICEBERG_PSCAN_MAGIC)
+    {
+        pg_atomic_write_u32(&ipscan->next_task, 0);
+    }
+#endif
 }
 
 /* ----------------------------------------------------------------

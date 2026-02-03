@@ -208,6 +208,183 @@ const char *iceberg_table_get_column_type(
     int column_index
 );
 
+/* ============================================================================
+ * Parallel Scan Support
+ * ============================================================================
+ */
+
+#define ICEBERG_PARALLEL_MAGIC 0x49434250  /* "ICBP" */
+#define ICEBERG_MAX_PATH_LENGTH 1024
+
+/*
+ * Iceberg file formats
+ * Each format has different chunking strategies for parallel reads
+ */
+typedef enum IcebergFileFormat {
+    ICEBERG_FORMAT_UNKNOWN = 0,
+    ICEBERG_FORMAT_PARQUET = 1,  /* Parallel by row group */
+    ICEBERG_FORMAT_ORC     = 2,  /* Parallel by stripe */
+    ICEBERG_FORMAT_AVRO    = 3   /* Parallel by file (blocks too small) */
+} IcebergFileFormat;
+
+/*
+ * Parallel scan task - represents one unit of work
+ *
+ * For Parquet: one row group
+ * For ORC: one stripe
+ * For Avro: one file (no sub-file parallelism)
+ */
+typedef struct IcebergParallelTask {
+    uint32_t    file_index;         /* Index into file list */
+    uint32_t    chunk_index;        /* Row group (Parquet) / Stripe (ORC) / 0 (Avro) */
+    uint32_t    chunk_count;        /* Total chunks in file (1 for Avro) */
+    uint8_t     file_format;        /* IcebergFileFormat */
+    uint8_t     padding[3];         /* Alignment padding */
+} IcebergParallelTask;
+
+/*
+ * File metadata for parallel scan
+ */
+typedef struct IcebergFileInfo {
+    char        path[ICEBERG_MAX_PATH_LENGTH];
+    int64_t     file_size;
+    uint32_t    chunk_count;        /* Row groups (Parquet) / Stripes (ORC) / 1 (Avro) */
+    uint8_t     file_format;        /* IcebergFileFormat */
+    uint8_t     padding[3];         /* Alignment padding */
+} IcebergFileInfo;
+
+/*
+ * Parallel scan shared state (stored in PostgreSQL DSM)
+ * This is the C-compatible layout that will be copied to shared memory
+ */
+typedef struct IcebergParallelState {
+    uint32_t    magic;              /* Validation magic number */
+    int64_t     snapshot_id;        /* Iceberg snapshot being read */
+    uint32_t    total_files;        /* Number of data files */
+    uint32_t    total_tasks;        /* Total number of tasks */
+    /* Variable length data follows:
+     * - IcebergFileInfo files[total_files]
+     * - IcebergParallelTask tasks[total_tasks]
+     */
+} IcebergParallelState;
+
+/*
+ * Opaque handle for parallel scan planning
+ */
+typedef struct IcebergParallelPlan IcebergParallelPlan;
+
+/*
+ * Create a parallel scan plan
+ * Analyzes all files and creates task list
+ *
+ * Returns: Plan handle, or NULL on failure
+ */
+IcebergParallelPlan *iceberg_parallel_plan_create(
+    IcebergTableHandle *table,
+    int64_t snapshot_id,
+    IcebergError *error
+);
+
+/*
+ * Get the size needed for parallel state in shared memory
+ */
+size_t iceberg_parallel_plan_get_size(IcebergParallelPlan *plan);
+
+/*
+ * Serialize parallel plan to shared memory buffer
+ *
+ * Parameters:
+ *   plan   - The parallel plan
+ *   buffer - Pre-allocated buffer (size from get_size)
+ *   size   - Size of buffer
+ *
+ * Returns: Actual bytes written, or 0 on failure
+ */
+size_t iceberg_parallel_plan_serialize(
+    IcebergParallelPlan *plan,
+    void *buffer,
+    size_t size
+);
+
+/*
+ * Free a parallel plan
+ */
+void iceberg_parallel_plan_free(IcebergParallelPlan *plan);
+
+/*
+ * Get number of files in plan
+ */
+uint32_t iceberg_parallel_plan_get_file_count(IcebergParallelPlan *plan);
+
+/*
+ * Get number of tasks in plan
+ */
+uint32_t iceberg_parallel_plan_get_task_count(IcebergParallelPlan *plan);
+
+/*
+ * Get file info from serialized state
+ */
+const IcebergFileInfo *iceberg_parallel_state_get_file(
+    const IcebergParallelState *state,
+    uint32_t file_index
+);
+
+/*
+ * Get task from serialized state
+ */
+const IcebergParallelTask *iceberg_parallel_state_get_task(
+    const IcebergParallelState *state,
+    uint32_t task_index
+);
+
+/*
+ * Begin a parallel scan for a specific task
+ *
+ * Parameters:
+ *   table      - Table handle
+ *   state      - Shared parallel state
+ *   task_index - Index of task to execute
+ *   error      - Error information if function fails
+ *
+ * Returns: Scan handle for this task, or NULL on failure
+ */
+IcebergScanHandle *iceberg_parallel_scan_begin(
+    IcebergTableHandle *table,
+    const IcebergParallelState *state,
+    uint32_t task_index,
+    IcebergError *error
+);
+
+/*
+ * Detect file format from file path extension
+ */
+IcebergFileFormat iceberg_detect_file_format(const char *file_path);
+
+/*
+ * Get chunk count for a file based on its format
+ *
+ * Parquet: returns number of row groups
+ * ORC: returns number of stripes
+ * Avro: returns 1 (file-level only)
+ *
+ * Returns 0 on error
+ */
+uint32_t iceberg_get_file_chunk_count(
+    const char *file_path,
+    IcebergFileFormat format,
+    IcebergError *error
+);
+
+/*
+ * Check if format supports sub-file parallelism
+ */
+bool iceberg_format_supports_chunks(IcebergFileFormat format);
+
+/*
+ * Get format name for logging
+ */
+const char *iceberg_format_name(IcebergFileFormat format);
+
 #ifdef __cplusplus
 }
 #endif
