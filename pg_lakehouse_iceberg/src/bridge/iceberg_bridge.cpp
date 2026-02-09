@@ -1226,6 +1226,188 @@ iceberg_bridge_parallel_scan_begin(IcebergTableHandle *table,
     }
 }
 
+/* ============================================================================
+ * Write Support Implementation
+ * ============================================================================
+ */
+
+/*
+ * Internal writer structure
+ */
+struct IcebergWriterHandle {
+    IcebergTableHandle *table;
+    std::vector<std::string> column_names;
+    std::string output_path;
+    int64_t record_count;
+    int64_t file_size;
+    bool finished;
+
+    /* TODO: Arrow/Parquet writer state */
+};
+
+extern "C" IcebergWriterHandle *
+iceberg_bridge_writer_create(IcebergTableHandle *table,
+                             const char **column_names,
+                             int num_columns,
+                             IcebergError *error)
+{
+    if (!table) {
+        set_error(error, 1, "Invalid table handle");
+        return nullptr;
+    }
+
+    try {
+        auto writer = new IcebergWriterHandle();
+        writer->table = table;
+        writer->record_count = 0;
+        writer->file_size = 0;
+        writer->finished = false;
+
+        for (int i = 0; i < num_columns; i++) {
+            writer->column_names.push_back(column_names[i]);
+        }
+
+        /*
+         * TODO: Initialize Parquet writer
+         *
+         * Steps:
+         *   1. Convert column info to Arrow schema
+         *   2. Generate output file path: {table_location}/data/{uuid}.parquet
+         *   3. Open Parquet writer via Arrow API
+         */
+
+        /* Generate output path */
+        std::string uuid = "00000000-0000-0000-0000-000000000000";  /* TODO: gen uuid */
+        writer->output_path = table->location + "/data/" + uuid + ".parquet";
+
+        return writer;
+
+    } catch (const std::exception &e) {
+        set_error(error, 1, e.what());
+        return nullptr;
+    }
+}
+
+extern "C" int
+iceberg_bridge_writer_append_batch(IcebergWriterHandle *writer,
+                                   void *batch,
+                                   void *schema,
+                                   IcebergError *error)
+{
+    if (!writer || writer->finished) {
+        set_error(error, 1, "Invalid writer handle");
+        return -1;
+    }
+
+    try {
+        /*
+         * TODO: Write Arrow batch to Parquet file
+         *
+         * ArrowArray *arr = (ArrowArray *)batch;
+         * ArrowSchema *sch = (ArrowSchema *)schema;
+         *
+         * parquet_writer->WriteRecordBatch(*batch);
+         * writer->record_count += arr->length;
+         */
+
+        return 0;
+
+    } catch (const std::exception &e) {
+        set_error(error, 1, e.what());
+        return -1;
+    }
+}
+
+extern "C" int
+iceberg_bridge_writer_finish(IcebergWriterHandle *writer,
+                             char **data_file_path,
+                             int64_t *record_count,
+                             int64_t *file_size,
+                             IcebergError *error)
+{
+    if (!writer || writer->finished) {
+        set_error(error, 1, "Invalid writer handle");
+        return -1;
+    }
+
+    try {
+        /*
+         * TODO: Close Parquet writer and get file stats
+         *
+         * parquet_writer->Close();
+         * writer->file_size = get_file_size(writer->output_path);
+         */
+
+        writer->finished = true;
+
+        if (data_file_path)
+            *data_file_path = strdup(writer->output_path.c_str());
+        if (record_count)
+            *record_count = writer->record_count;
+        if (file_size)
+            *file_size = writer->file_size;
+
+        return 0;
+
+    } catch (const std::exception &e) {
+        set_error(error, 1, e.what());
+        return -1;
+    }
+}
+
+extern "C" void
+iceberg_bridge_writer_destroy(IcebergWriterHandle *writer)
+{
+    delete writer;
+}
+
+/* ============================================================================
+ * Schema Conversion Implementation
+ * ============================================================================
+ */
+
+extern "C" int
+iceberg_bridge_pg_to_arrow_schema(void *tupdesc,
+                                  void *out_schema,
+                                  IcebergError *error)
+{
+    /*
+     * TODO: Convert PG TupleDesc to Arrow Schema
+     *
+     * Mapping:
+     *   INT4OID    → int32 ("i")
+     *   INT8OID    → int64 ("l")
+     *   FLOAT4OID  → float  ("f")
+     *   FLOAT8OID  → double ("g")
+     *   BOOLOID    → bool   ("b")
+     *   TEXTOID    → utf8   ("u")
+     *   TIMESTAMPOID → timestamp_us ("tsu:")
+     *   DATEOID    → date32 ("tdD")
+     */
+
+    set_error(error, 1, "pg_to_arrow_schema not yet implemented");
+    return -1;
+}
+
+extern "C" int
+iceberg_bridge_slot_to_arrow_array(void *slot,
+                                   void *schema,
+                                   void *out_array,
+                                   IcebergError *error)
+{
+    /*
+     * TODO: Convert PG TupleTableSlot to Arrow Array
+     *
+     * Steps:
+     *   1. Extract Datum/isnull from slot
+     *   2. Build Arrow buffers (validity, data, offsets)
+     *   3. Fill ArrowArray struct
+     */
+
+    set_error(error, 1, "slot_to_arrow_array not yet implemented");
+    return -1;
+}
+
 #else /* !HAVE_ICEBERG_CPP */
 
 /*

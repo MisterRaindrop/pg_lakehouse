@@ -34,14 +34,23 @@ set(EXTENSION_VERSION ${PROJECT_VERSION})
 # Source files
 # ============================================================================
 
-# C sources (PostgreSQL extension entry point)
+# C sources (PostgreSQL extension code)
 set(EXTENSION_C_SOURCES
     src/iceberg_am.c
+    src/handler.c
+    src/operations/table_ops.c
+    src/operations/scan_ops.c
+    src/operations/write_ops.c
+    src/operations/commit_ops.c
+    src/io/file_io.c
+    src/io/s3_io.c
 )
 
-# C++ sources (iceberg-cpp bridge)
+# C++ sources (iceberg-cpp bridge + catalog)
 set(EXTENSION_CXX_SOURCES
-    src/iceberg_bridge.cpp
+    src/bridge/iceberg_bridge.cpp
+    src/catalog/pg_catalog.cpp
+    src/catalog/catalog_bridge.cpp
 )
 
 # ============================================================================
@@ -63,7 +72,7 @@ target_include_directories(${EXTENSION_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
-# Compiler settings for C
+# Compiler settings
 target_compile_options(${EXTENSION_NAME} PRIVATE
     $<$<COMPILE_LANGUAGE:C>:-Wall -Wextra -Wno-unused-parameter>
     $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter>

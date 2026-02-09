@@ -391,6 +391,113 @@ bool iceberg_bridge_format_supports_chunks(IcebergFileFormat format);
  */
 const char *iceberg_bridge_format_name(IcebergFileFormat format);
 
+/* ============================================================================
+ * Write Support
+ * ============================================================================
+ */
+
+/*
+ * Opaque writer handle
+ */
+typedef struct IcebergWriterHandle IcebergWriterHandle;
+
+/*
+ * Create a Parquet writer for an Iceberg table.
+ *
+ * @param table         Table handle (for schema info)
+ * @param column_names  Array of column names to write
+ * @param num_columns   Number of columns
+ * @param error         Error info on failure
+ * @return Writer handle, or NULL on failure
+ */
+IcebergWriterHandle *iceberg_bridge_writer_create(
+    IcebergTableHandle *table,
+    const char **column_names,
+    int num_columns,
+    IcebergError *error
+);
+
+/*
+ * Append an Arrow RecordBatch to the writer.
+ *
+ * @param writer  Writer handle
+ * @param batch   Arrow array (batch data)
+ * @param schema  Arrow schema
+ * @param error   Error info on failure
+ * @return 0 on success
+ */
+int iceberg_bridge_writer_append_batch(
+    IcebergWriterHandle *writer,
+    void *batch,       /* ArrowArray* */
+    void *schema,      /* ArrowSchema* */
+    IcebergError *error
+);
+
+/*
+ * Finish writing and close the output file.
+ *
+ * Returns the path, record count, and file size of the written Parquet file.
+ *
+ * @param writer          Writer handle
+ * @param data_file_path  Output: path of the written file (caller must free)
+ * @param record_count    Output: number of records written
+ * @param file_size       Output: size of the written file in bytes
+ * @param error           Error info on failure
+ * @return 0 on success
+ */
+int iceberg_bridge_writer_finish(
+    IcebergWriterHandle *writer,
+    char **data_file_path,
+    int64_t *record_count,
+    int64_t *file_size,
+    IcebergError *error
+);
+
+/*
+ * Destroy a writer handle and free resources.
+ */
+void iceberg_bridge_writer_destroy(IcebergWriterHandle *writer);
+
+/* ============================================================================
+ * Schema Conversion (PG ↔ Arrow)
+ * ============================================================================
+ */
+
+/*
+ * Convert a PG TupleDesc to an Arrow schema.
+ *
+ * @param tupdesc     PG tuple descriptor
+ * @param out_schema  Output: Arrow schema (caller owns)
+ * @param error       Error info on failure
+ * @return 0 on success
+ *
+ * Note: tupdesc is void* here to avoid PG header dependency in C++ files.
+ *       Cast to TupleDesc in the caller.
+ */
+int iceberg_bridge_pg_to_arrow_schema(
+    void *tupdesc,
+    void *out_schema,   /* ArrowSchema* */
+    IcebergError *error
+);
+
+/*
+ * Convert a PG TupleTableSlot to an Arrow array.
+ *
+ * @param slot        PG tuple slot
+ * @param schema      Arrow schema (from pg_to_arrow_schema)
+ * @param out_array   Output: Arrow array (caller owns)
+ * @param error       Error info on failure
+ * @return 0 on success
+ *
+ * Note: slot is void* here to avoid PG header dependency.
+ */
+int iceberg_bridge_slot_to_arrow_array(
+    void *slot,
+    void *schema,       /* ArrowSchema* */
+    void *out_array,    /* ArrowArray* */
+    IcebergError *error
+);
+
 #ifdef __cplusplus
 }
 #endif
